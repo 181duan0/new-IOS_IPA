@@ -1,0 +1,33 @@
+name: tangoinnos_ota
+description: "TANGOINNOS Unified OTA Updater — Host Firmware OTA (CH582) & ABBM BLE Secure DFU (nRF52)"
+publish_to: 'none'
+version: 2.0.2+22
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_blue_plus: ^1.35.3
+  file_picker: ^8.1.7
+  permission_handler: ^11.3.1
+  archive: ^3.6.1
+  crypto: ^3.0.6
+  path_provider: ^2.1.5
+  share_plus: ^10.1.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/firmware/iap_new.bin
+    - assets/firmware/ABBM-BLE-FIRE4000-v73.20.zip
+    - assets/firmware/FIRE4000-V0.3.6.5-AB73.12.bin
+    - assets/firmware/FIRE4000-Original-AB31.bin
+    - assets/images/app_icon.png
