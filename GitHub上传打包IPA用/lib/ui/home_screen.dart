@@ -73,7 +73,7 @@ class _HomeScreenState extends State<HomeScreen> {
                           border: Border.all(color: TacticalColors.border),
                         ),
                         child: const Text(
-                          'v2.0.2',
+                          'v2.0.3',
                           style: TextStyle(
                             color: TacticalColors.textSecondary,
                             fontSize: 11,
