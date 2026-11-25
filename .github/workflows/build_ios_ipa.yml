@@ -1,0 +1,47 @@
+name: Build Unsigned iOS IPA (TANGOINNOS OTA)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-ios-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare clean ASCII workspace
+        run: |
+          SRC_DIR="$(dirname "$(find . -maxdepth 3 -name pubspec.yaml | head -n 1)")"
+          echo "Detected Flutter project at: $SRC_DIR"
+          rm -rf "$RUNNER_TEMP/tangoinnos_ota"
+          cp -R "$SRC_DIR" "$RUNNER_TEMP/tangoinnos_ota"
+
+      - name: Install dependencies and build iOS Release (No Codesign)
+        working-directory: ${{ runner.temp }}/tangoinnos_ota
+        run: |
+          flutter --version
+          flutter pub get
+          flutter build ios --release --no-codesign
+
+      - name: Package Unsigned IPA for iOS Sideloading
+        working-directory: ${{ runner.temp }}/tangoinnos_ota
+        run: |
+          mkdir -p build/ipa/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ipa/Payload/
+          cd build/ipa
+          zip -r -9 "$GITHUB_WORKSPACE/TangoInnos_OTA_v2.0.2_unsigned.ipa" Payload
+          ls -lh "$GITHUB_WORKSPACE/TangoInnos_OTA_v2.0.2_unsigned.ipa"
+
+      - name: Upload Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TangoInnos_OTA_v2.0.2_unsigned_ipa
+          path: TangoInnos_OTA_v2.0.2_unsigned.ipa
