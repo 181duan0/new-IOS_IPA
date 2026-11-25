@@ -4,6 +4,10 @@ on:
   push:
   workflow_dispatch:
 
+concurrency:
+  group: build-ios-ipa
+  cancel-in-progress: true
+
 jobs:
   build-ios-ipa:
     runs-on: macos-latest
@@ -37,11 +41,11 @@ jobs:
           mkdir -p build/ipa/Payload
           cp -R build/ios/iphoneos/Runner.app build/ipa/Payload/
           cd build/ipa
-          zip -r -9 "$GITHUB_WORKSPACE/TangoInnos_OTA_v2.0.2_unsigned.ipa" Payload
-          ls -lh "$GITHUB_WORKSPACE/TangoInnos_OTA_v2.0.2_unsigned.ipa"
+          zip -r -9 "$GITHUB_WORKSPACE/TangoInnos_OTA_v2.0.3_unsigned.ipa" Payload
+          ls -lh "$GITHUB_WORKSPACE/TangoInnos_OTA_v2.0.3_unsigned.ipa"
 
       - name: Upload Unsigned IPA Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TangoInnos_OTA_v2.0.2_unsigned_ipa
-          path: TangoInnos_OTA_v2.0.2_unsigned.ipa
+          name: TangoInnos_OTA_v2.0.3_unsigned_ipa
+          path: TangoInnos_OTA_v2.0.3_unsigned.ipa
