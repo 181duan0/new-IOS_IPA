@@ -1,7 +1,7 @@
 name: tangoinnos_ota
 description: "TANGOINNOS Unified OTA Updater — Host Firmware OTA (CH582) & ABBM BLE Secure DFU (nRF52)"
 publish_to: 'none'
-version: 2.0.2+22
+version: 2.0.3+23
 
 environment:
   sdk: ^3.5.0
