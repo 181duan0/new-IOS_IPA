@@ -1,17 +1,19 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import '../core/host_firmware.dart';
 import 'ble_models.dart';
 
 /// Host Firmware OTA Engine (CH582 / FIRE4000).
-/// Matches the battle-tested Android Ballistic Computer OTA v1.8.2 protocol:
+/// Matches the battle-tested Android Ballistic Computer OTA v1.8.2 & iOS OTAUpdater protocols:
 /// - Connects with `mtu: null`, discovers with `subscribeToServicesChanged: false`
 ///   (prevents CH582 `GATT_INSUFFICIENT_RESOURCES` on 0x2A05).
-/// - Requests high connection priority and MTU 247 with retry.
+/// - Waits 600 ms after discovery for CH582 connection-parameter stabilization before 0x84/0x81,
+///   and defers Android ConnectionPriority.high until after Erase completes.
 /// - Automatically triggers 0xFFE3 -> 0x01 if device is running normal APP firmware.
 /// - Executes 0x84 Info ([0x84, 0x00] -> r[1..4]=limit, r[5..6]=block, r[7..8]=CHIP_ID),
-///   0x81 Erase (4 KB blocks), 0x80 Program + 0x82 Verify, 0x83 End.
+///   chunked 0x81 Erase (with self-healing 1-block recovery), 0x80 Program + 0x82 Verify, 0x83 End.
 class HostOtaService {
   static const int cmdProm = 0x80;
   static const int cmdErase = 0x81;
@@ -34,6 +36,39 @@ class HostOtaService {
     final blockSize = rawBlk == 0 ? defaultBlockSize : rawBlk;
     final chipId = (info[7] & 0xFF) | ((info[8] & 0xFF) << 8);
     return (limit: limit, blockSize: blockSize, chipId: chipId);
+  }
+
+  @visibleForTesting
+  static Uint8List buildErasePacket(int startAddr, int blocks) {
+    final a16 = startAddr ~/ 16;
+    return Uint8List.fromList([
+      cmdErase,
+      0x04,
+      a16 & 0xFF,
+      (a16 >> 8) & 0xFF,
+      blocks & 0xFF,
+      (blocks >> 8) & 0xFF,
+    ]);
+  }
+
+  @visibleForTesting
+  static List<({int start, int blocks})> planEraseBatches(
+    int base,
+    int totalBlocks, {
+    required int blockSize,
+    required int maxBlocksPerBatch,
+  }) {
+    if (totalBlocks <= 0) return const [];
+    final step = maxBlocksPerBatch < 1 ? 1 : maxBlocksPerBatch;
+    final batches = <({int start, int blocks})>[];
+    int offset = 0;
+    while (offset < totalBlocks) {
+      final rem = totalBlocks - offset;
+      final count = rem < step ? rem : step;
+      batches.add((start: base + offset * blockSize, blocks: count));
+      offset += count;
+    }
+    return batches;
   }
 
   static Future<void> upgrade({
@@ -107,6 +142,8 @@ class HostOtaService {
       onLog('Connected to ${target.remoteId.str}, MTU=$mtu');
     }
 
+    BluetoothCharacteristic activeOtaChar = otaChar;
+
     try {
       if (mtu < 100) {
         onLog('⚠ MTU negotiated only $mtu; transfer will be slower (reconnecting usually reaches 247)');
@@ -114,7 +151,7 @@ class HostOtaService {
 
       // 2) 0x84 Device info
       onStage('Reading device info...');
-      final (:limit, :blockSize, :chipId) = await _otaInfo(otaChar);
+      final (:limit, :blockSize, :chipId) = await _otaInfo(activeOtaChar);
       onLog(
         'Device info: partition limit 0x${limit.toRadixString(16).toUpperCase()}, '
         'block $blockSize B, CHIP_ID 0x${chipId.toRadixString(16).toUpperCase().padLeft(4, '0')}',
@@ -126,26 +163,128 @@ class HostOtaService {
         );
       }
 
-      // 3) 0x81 Erase 4 KB blocks
+      // 3) 0x81 Erase 4 KB blocks in small batches with self-healing auto-recovery
       final blocks = (fw.end - fw.base + blockSize - 1) ~/ blockSize;
-      onStage('Erasing $blocks blocks from 0x${fw.base.toRadixString(16).toUpperCase()}...');
-      onProgress(0, 'Erasing $blocks blocks ($blockSize B each)...');
-      onLog('Erasing $blocks blocks from 0x${fw.base.toRadixString(16).toUpperCase()}...');
-      final er = await _otaErase(otaChar, fw.base, blocks, isCancelled);
-      if (er.isEmpty || er[0] != 0) {
-        final code = er.isNotEmpty ? er[0] : 0xFF;
-        throw Exception(
-          'Erase failed, status=0x${code.toRadixString(16).toUpperCase().padLeft(2, '0')}',
+      int batchSize = Platform.isIOS ? 2 : 4;
+      bool eraseNoRsp = false;
+      int doneBlocks = 0;
+      int eraseRecoveries = 0;
+
+      onLog(
+        'Erasing $blocks blocks from 0x${fw.base.toRadixString(16).toUpperCase()} '
+        '($batchSize blocks/batch)...',
+      );
+
+      while (doneBlocks < blocks) {
+        if (isCancelled()) throw Exception('Cancelled by user');
+
+        final count = (blocks - doneBlocks) < batchSize ? (blocks - doneBlocks) : batchSize;
+        final batchStart = fw.base + doneBlocks * blockSize;
+        onStage('Erasing $doneBlocks / $blocks blocks...');
+        onProgress(
+          0,
+          'Erasing $doneBlocks / $blocks blocks (0x${batchStart.toRadixString(16).toUpperCase()})...',
         );
+
+        try {
+          final er = await _otaEraseBatch(
+            activeOtaChar,
+            batchStart,
+            count,
+            withoutResponse: eraseNoRsp,
+            isCancelled: isCancelled,
+          );
+          if (er.isEmpty || er[0] != 0) {
+            final code = er.isNotEmpty ? er[0] : 0xFF;
+            throw Exception(
+              'Erase failed @0x${batchStart.toRadixString(16).toUpperCase()}, '
+              'status=0x${code.toRadixString(16).toUpperCase().padLeft(2, '0')}',
+            );
+          }
+          doneBlocks += count;
+          onProgress(0, 'Erasing $doneBlocks / $blocks blocks...');
+          if (doneBlocks < blocks) {
+            await Future.delayed(const Duration(milliseconds: 40));
+          }
+        } catch (e) {
+          final msg = e.toString();
+          if (msg.contains('Cancelled') || msg.contains('Erase failed @') || eraseRecoveries >= 2) {
+            rethrow;
+          }
+          eraseRecoveries++;
+          onLog(
+            'Erase interrupted at block $doneBlocks/$blocks ($e) — '
+            'reconnecting in OTA mode and resuming with 1-block safe mode...',
+          );
+          await BleConnectionHelper.disconnectClean(
+            target,
+            settle: const Duration(milliseconds: 1200),
+          );
+
+          BluetoothCharacteristic? recoveredChar;
+          try {
+            final (rmtu, rservices) = await _openSessionWithRetry(target, onLog, isCancelled);
+            recoveredChar =
+                BleUuids.findChar(rservices, BleUuids.chrOta, serviceUuid: BleUuids.svcOta) ??
+                    BleUuids.findChar(rservices, BleUuids.chrOta);
+            if (recoveredChar != null) {
+              mtu = rmtu;
+              services = rservices;
+            } else {
+              await BleConnectionHelper.disconnectClean(
+                target,
+                settle: const Duration(milliseconds: 600),
+              );
+            }
+          } catch (connErr) {
+            if (connErr.toString().contains('Cancelled')) rethrow;
+            await BleConnectionHelper.disconnectClean(
+              target,
+              settle: const Duration(milliseconds: 600),
+            );
+          }
+
+          if (recoveredChar == null) {
+            final otaSession = await _waitForOtaSession(
+              originalId: target.remoteId.str,
+              timeout: const Duration(seconds: 25),
+              onLog: onLog,
+              onStage: onStage,
+              isCancelled: isCancelled,
+            );
+            target = otaSession.device;
+            mtu = otaSession.mtu;
+            services = otaSession.services;
+            recoveredChar = otaSession.otaChar;
+          }
+
+          activeOtaChar = recoveredChar;
+          await _otaInfo(activeOtaChar);
+          batchSize = 1;
+          eraseNoRsp = activeOtaChar.properties.writeWithoutResponse;
+        }
       }
-      onLog('Erase complete');
+      onLog('Erase complete ($blocks blocks)');
+
+      // Boost Android connection priority only after Flash erase finishes
+      if (Platform.isAndroid) {
+        try {
+          await target.requestConnectionPriority(
+            connectionPriorityRequest: ConnectionPriority.high,
+          );
+          await Future.delayed(const Duration(milliseconds: 200));
+        } catch (_) {}
+      }
+
+      final liveMtu = target.mtuNow;
+      if (liveMtu >= 23) mtu = liveMtu;
 
       // 4) 0x80 Program + 0x82 Verify
       int chunk = ((mtu - 3 - 4) ~/ 16) * 16;
       if (chunk < 16) chunk = 16;
       if (chunk > 240) chunk = 240;
 
-      bool perPacket = verifyEveryPacket || !otaChar.properties.writeWithoutResponse;
+      bool perPacket = verifyEveryPacket || !activeOtaChar.properties.writeWithoutResponse;
       final total = fw.size;
       onLog(
         'Chunk $chunk bytes (MTU $mtu, ${perPacket ? "verify every packet" : "write without response"})',
@@ -167,7 +306,7 @@ class HostOtaService {
       if (!perPacket && total > 0) {
         try {
           final firstLen = total < chunk ? total : chunk;
-          await _writeNoRspWithRetry(otaChar, buildPkt(fw.base, 0, firstLen), isCancelled);
+          await _writeNoRspWithRetry(activeOtaChar, buildPkt(fw.base, 0, firstLen), isCancelled);
           await Future.delayed(const Duration(milliseconds: 80));
         } catch (e) {
           if (e.toString().contains('Cancelled')) rethrow;
@@ -179,6 +318,8 @@ class HostOtaService {
       int off = 0;
       int since = 0;
       int lastPct = -1;
+      Uint8List? lastPkt;
+      int lastAddr = fw.base;
       final writeSw = Stopwatch()..start();
 
       while (off < total) {
@@ -187,9 +328,11 @@ class HostOtaService {
         final n = (total - off) < chunk ? (total - off) : chunk;
         final addrI = fw.base + off;
         final pkt = buildPkt(addrI, off, n);
+        lastPkt = pkt;
+        lastAddr = addrI;
 
         if (perPacket) {
-          final r1 = await _otaCmd(otaChar, pkt, minLen: 1);
+          final r1 = await _otaCmd(activeOtaChar, pkt, minLen: 1);
           if (r1[0] != 0) {
             throw Exception(
               'Write failed @0x${addrI.toRadixString(16).toUpperCase()}, '
@@ -198,7 +341,7 @@ class HostOtaService {
           }
           if (verifyEveryPacket) {
             final vPkt = Uint8List.fromList(pkt)..[0] = cmdVerify;
-            final r2 = await _otaCmd(otaChar, vPkt, minLen: 1);
+            final r2 = await _otaCmd(activeOtaChar, vPkt, minLen: 1);
             if (r2[0] != 0) {
               throw Exception(
                 'Verify failed @0x${addrI.toRadixString(16).toUpperCase()}, '
@@ -208,7 +351,7 @@ class HostOtaService {
           }
         } else {
           try {
-            await _writeNoRspWithRetry(otaChar, pkt, isCancelled);
+            await _writeNoRspWithRetry(activeOtaChar, pkt, isCancelled);
             await Future.delayed(Duration(milliseconds: (since & 7) == 0 ? 2 : 1));
             since++;
             if (since >= 32) {
@@ -216,7 +359,7 @@ class HostOtaService {
               onLog('Sent ${off + n} / $total B, waiting for the device...');
               await Future.delayed(const Duration(milliseconds: 130));
               final vPkt = Uint8List.fromList(pkt)..[0] = cmdVerify;
-              final r = await _otaCmd(otaChar, vPkt, minLen: 1);
+              final r = await _otaCmd(activeOtaChar, vPkt, minLen: 1);
               if (r[0] != 0) {
                 throw Exception(
                   'Verify failed @0x${addrI.toRadixString(16).toUpperCase()}, '
@@ -248,7 +391,17 @@ class HostOtaService {
         }
       }
 
-      if (!perPacket) {
+      if (!perPacket && since > 0 && lastPkt != null) {
+        await Future.delayed(const Duration(milliseconds: 130));
+        final vPkt = Uint8List.fromList(lastPkt)..[0] = cmdVerify;
+        final r = await _otaCmd(activeOtaChar, vPkt, minLen: 1);
+        if (r[0] != 0) {
+          throw Exception(
+            'Verify failed @0x${lastAddr.toRadixString(16).toUpperCase()}, '
+            'status=0x${r[0].toRadixString(16).toUpperCase().padLeft(2, '0')}',
+          );
+        }
+      } else if (!perPacket) {
         await Future.delayed(const Duration(milliseconds: 100));
       }
 
@@ -256,7 +409,7 @@ class HostOtaService {
       onStage('Writing end marker...');
       onProgress(100, 'Finalizing and rebooting device...');
       try {
-        await otaChar.write([cmdEnd, 0x00], withoutResponse: false);
+        await activeOtaChar.write([cmdEnd, 0x00], withoutResponse: false);
       } catch (e) {
         onLog('End marker response error (normal as device jumps to APP immediately): $e');
       }
@@ -282,11 +435,23 @@ class HostOtaService {
     for (int attempt = 1; attempt <= 3; attempt++) {
       if (isCancelled()) throw Exception('Cancelled by user');
       try {
-        await BleConnectionHelper.connectClean(dev, timeout: const Duration(seconds: 12));
+        await BleConnectionHelper.connectClean(
+          dev,
+          timeout: const Duration(seconds: 12),
+          requestHighPriority: false,
+        );
         int mtu = await BleConnectionHelper.negotiateMtu(dev, desired: 247);
         final services = await BleConnectionHelper.discoverSafe(dev);
-        if (mtu < 100) {
-          mtu = await BleConnectionHelper.negotiateMtu(dev, desired: 247);
+        // Let CH582 GAP connection-parameter negotiation (625 ms timer) and
+        // CoreBluetooth background discovery settle before 0x84/0x81.
+        await Future.delayed(const Duration(milliseconds: 600));
+        if (Platform.isAndroid) {
+          if (mtu < 100) {
+            mtu = await BleConnectionHelper.negotiateMtu(dev, desired: 247);
+          }
+        } else {
+          final live = dev.mtuNow;
+          if (live >= 23) mtu = live;
         }
         return (mtu, services);
       } catch (e) {
@@ -461,8 +626,8 @@ class HostOtaService {
     CancelCheck isCancelled,
   ) async {
     Object? lastErr;
-    int waitMs = 8;
-    for (int i = 0; i < 6; i++) {
+    int waitMs = 10;
+    for (int i = 0; i < 20; i++) {
       if (isCancelled()) throw Exception('Cancelled by user');
       try {
         await ch.write(pkt, withoutResponse: true);
@@ -471,10 +636,10 @@ class HostOtaService {
         lastErr = e;
         if (ch.device.isDisconnected) rethrow;
         await Future.delayed(Duration(milliseconds: waitMs));
-        waitMs = (waitMs * 2).clamp(8, 200);
+        waitMs = (waitMs * 2).clamp(10, 150);
       }
     }
-    throw Exception('Write without response rejected after 6 retries: $lastErr');
+    throw Exception('Write without response rejected after 20 retries: $lastErr');
   }
 
   static Future<List<int>> _otaCmd(
@@ -514,33 +679,39 @@ class HostOtaService {
     }
   }
 
-  static Future<List<int>> _otaErase(
+  static Future<List<int>> _otaEraseBatch(
     BluetoothCharacteristic ch,
     int start,
-    int blocks,
-    CancelCheck isCancelled,
-  ) async {
-    final a16 = start ~/ 16;
-    final pkt = [
-      cmdErase,
-      0x04,
-      a16 & 0xFF,
-      (a16 >> 8) & 0xFF,
-      blocks & 0xFF,
-      (blocks >> 8) & 0xFF,
-    ];
-    await ch.write(pkt, withoutResponse: false);
-    await Future.delayed(Duration(milliseconds: blocks * 25 + 200));
+    int blocks, {
+    required bool withoutResponse,
+    required CancelCheck isCancelled,
+  }) async {
+    final pkt = buildErasePacket(start, blocks);
+    if (withoutResponse) {
+      await _writeNoRspWithRetry(ch, pkt, isCancelled);
+    } else {
+      await ch.write(pkt, withoutResponse: false, timeout: 8);
+    }
+    await Future.delayed(
+      Duration(milliseconds: blocks * 30 + (withoutResponse ? 140 : 90)),
+    );
 
-    final deadline = DateTime.now().add(Duration(milliseconds: blocks * 45 + 5000));
+    final deadline = DateTime.now().add(
+      Duration(milliseconds: blocks * 120 + 4500),
+    );
     while (DateTime.now().isBefore(deadline)) {
       if (isCancelled()) throw Exception('Cancelled by user');
+      if (ch.device.isDisconnected) {
+        throw Exception('Device disconnected while polling erase status');
+      }
       try {
-        final r = await ch.read();
+        final r = await ch.read(timeout: 5);
         if (r.length == 2) return r;
-      } catch (_) {}
-      await Future.delayed(const Duration(milliseconds: 120));
+      } catch (e) {
+        if (ch.device.isDisconnected) rethrow;
+      }
+      await Future.delayed(const Duration(milliseconds: 80));
     }
-    throw Exception('Erase timed out ($blocks blocks)');
+    throw Exception('Erase timed out ($blocks blocks @0x${start.toRadixString(16).toUpperCase()})');
   }
 }
