@@ -94,6 +94,7 @@ class BleConnectionHelper {
   static Future<void> connectClean(
     BluetoothDevice d, {
     Duration timeout = const Duration(seconds: 15),
+    bool requestHighPriority = true,
   }) async {
     try {
       if (d.isConnected) {
@@ -105,7 +106,7 @@ class BleConnectionHelper {
     await d.connect(timeout: timeout, mtu: null, autoConnect: false);
     await Future.delayed(const Duration(milliseconds: 300));
 
-    if (Platform.isAndroid) {
+    if (Platform.isAndroid && requestHighPriority) {
       try {
         await d.requestConnectionPriority(
           connectionPriorityRequest: ConnectionPriority.high,
